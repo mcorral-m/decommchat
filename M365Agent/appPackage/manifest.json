@@ -1,0 +1,71 @@
+{
+    "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.21/MicrosoftTeams.schema.json",
+    "manifestVersion": "1.21",
+    "version": "1.0.0",
+    "id": "123e4567-e89b-12d3-a456-426614174001",
+    "developer": {
+        "name": "Teams App, Inc.",
+        "websiteUrl": "https://www.example.com",
+        "privacyUrl": "https://www.example.com/privacy",
+        "termsOfUseUrl": "https://www.example.com/termofuse"
+    },
+    "icons": {
+        "color": "color.png",
+        "outline": "outline.png"
+    },
+    "name": {
+        "short": "DecomAgent${{APP_NAME_SUFFIX}}",
+        "full": "full name for DecomAgent"
+    },
+    "description": {
+        "short": "Short description of DeomissionAgent",
+        "full": "Full description of DeomissionAgent"
+    },
+    "accentColor": "#FFFFFF",
+    "copilotAgents": {
+        "customEngineAgents": [
+            {
+                "type": "bot",
+                "id": "123e4567-e89b-12d3-a456-426614174000"
+            }
+        ]
+    },
+    "bots": [
+        {
+            "botId": "123e4567-e89b-12d3-a456-426614174002",
+            "scopes": [
+                "copilot",
+                "personal"
+            ],
+            "supportsFiles": false,
+            "isNotificationOnly": false,
+            "commandLists": [
+                {
+                    "scopes": [
+                        "copilot",
+                        "personal"
+                    ],
+                    "commands": [
+                        {
+                            "title": "How can you help me?",
+                            "description": "How can you help me?"
+                        },
+                        {
+                            "title": "Forecast the weather tomorrow in San Francisco.",
+                            "description": "Can you forecast the tomorrow weather in San Francisco for me?"
+                        }
+                    ]
+                }
+            ]
+        }
+    ],
+    "composeExtensions": [
+    ],
+    "configurableTabs": [],
+    "staticTabs": [],
+    "permissions": [
+        "identity",
+        "messageTeamMembers"
+    ],
+    "validDomains": []
+}

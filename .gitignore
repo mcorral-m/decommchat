@@ -1,0 +1,18 @@
+appsettings.Development.json
+appsettings.json
+appsettings.Local.json
+appsettings.Playground.json
+/M365Agent/env/.env.dev.user
+/M365Agent/env/.env.playground.user
+/M365Agent/env/.env.local.user
+ IDE
+.vs/
+.vscode/
+*.suo
+*.user
+*.slnLaunch.user
+bin/
+obj/
+
+Thumbs.db
+.DS_Store

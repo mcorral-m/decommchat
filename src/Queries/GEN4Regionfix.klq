@@ -1,0 +1,200 @@
+// STEP 1: Gen4 clusters
+let Gen4WithoutDecomPair =
+cluster('azuredcm.kusto.windows.net').database('AzureDCMDb').dcmInventoryGenerationMappingV3
+| where ClusterType == 'Compute'
+| extend MajorGeneration = tostring(split(Generation, '.')[0])
+| summarize GenerationList = array_strcat(array_sort_asc(make_set(MajorGeneration)), ',') by ClusterName = ClusterId
+| where GenerationList == '4'
+| distinct ClusterName
+;
+// STEP 2: Utilization & infra (no ACU / no TiP node analytics)
+let ClusterUtilizationData =
+cluster('onecapacityfollower.centralus.kusto.windows.net').database('Shared').EfficiencyTracker_Get_LatestDecommInsights
+| where Cluster in (Gen4WithoutDecomPair)
+| summarize
+    TotalCore=todouble(sum(TotalPhysicalCores)),
+    UsedCore=todouble(sum(UsedCores)),
+    UsedSQL=todouble(sum(UsedCores_SQL)),
+    UsedNonSQL=todouble(sum(UsedCores_NonSQL)),
+    UsedNonSQL_Spannable=todouble(sum(UsedCores_NonSQL_Spannable)),
+    UsedNonSQL_NonSpannable=todouble(sum(UsedCores_NonSQL_NonSpannable)),
+    VMCount=sum(VMCount),
+    VMCount_SQL=sum(VMCount_SQL),
+    VMCount_NonSQL=sum(VMCount_NonSQL),
+    VMCount_NonSQL_Spannable=sum(VMCount_NonSQL_Spannable),
+    VMCount_NonSQL_NonSpannable=sum(VMCount_NonSQL_NonSpannable),
+    MaxSupportedVMs=sum(MaxSupportedVMs),
+    Nodes=sum(NodeCount),
+    RackCount=sum(RackCount),
+    OutOfServices=sum(NodeCount_OOS),
+    DNG_Nodes=sum(NodeCount_DNG),
+    StrandedCores_DNG=todouble(sum(StrandedPhysicalCores_DNG)),
+    StrandedCores_TIP=todouble(sum(StrandedPhysicalCores_TIP)),
+    NodeCount_IOwnMachine=sum(NodeCount_IOwnMachine),
+    NodeCount_32VMs=sum(NodeCount_32VMs),
+    StrandedCores_32VMs=todouble(sum(StrandedPhysicalCores_32VMs)),
+    PhysicalCoresPerNode=any(PhysicalCoresPerNode),
+    MPCountInCluster=any(MPCountInCluster),
+    RackCountInCluster=any(RackCountInCluster),
+    IsLive=any(IsLive),
+    ClusterType=any(ClusterType),
+    IsTargetMP=any(IsTargetMP),
+    TenantWithMaxFD=any(TenantNameWithMaxFDCountInCluster),
+    Generation=any(Generation),
+    Manufacturer=any(Manufacturer),
+    MemCategory=any(MemCategory),
+    IsSpecialtySKU=any(IsSpecialtySKU),
+    TransitionSKUCategory=any(TransitionSKUCategory)
+    by Cluster
+| extend 
+    CoreUtilization = round(UsedCore / TotalCore * 100, 2),
+    VMDensity = round(todouble(VMCount) / MaxSupportedVMs * 100, 2),
+    OutOfServicesPercentage = round(todouble(OutOfServices) / Nodes * 100, 2),
+    SQL_Ratio = round(UsedSQL / UsedCore * 100, 2),
+    NonSpannable_Ratio = round(UsedNonSQL_NonSpannable / UsedNonSQL * 100, 2),
+    SpannableUtilizationRatio = round(UsedNonSQL_Spannable / (UsedNonSQL_Spannable + UsedNonSQL_NonSpannable) * 100, 2),
+    HealthyNodeRatio = round(todouble(Nodes - OutOfServices - DNG_Nodes) / Nodes * 100, 2),
+    EffectiveCoreUtilization = round((UsedCore - StrandedCores_DNG - StrandedCores_TIP) / TotalCore * 100, 2)
+;
+// STEP 3: Cluster properties & age (gives us Region)
+let ClusterPropertiesData =
+cluster('onecapacityfollower.centralus.kusto.windows.net').database('Shared')._CCC_Cache_ClusterProperties
+| where Cluster in (Gen4WithoutDecomPair)
+| where isnotempty(ClusterLIVEDate)
+| summarize arg_max(PreciseTimeStamp, *) by Cluster
+| extend 
+    ClusterAgeDays  = datetime_diff('day', now(), ClusterLIVEDate),
+    ClusterAgeYears = round(todouble(datetime_diff('day', now(), ClusterLIVEDate)) / 365.25, 1),
+    DecommissionTimeRemaining   = datetime_diff('day', ClusterDecommisionDate, now()),
+    DecommissionYearsRemaining  = round(todouble(datetime_diff('day', ClusterDecommisionDate, now())) / 365.25, 1)
+| project Cluster, Region, DC, AvailabilityZone, PhysicalAZ, 
+    ClusterAgeDays, ClusterAgeYears, DecommissionTimeRemaining, DecommissionYearsRemaining,
+    Generation, Manufacturer, MemCategory, CloudType, RegionType, Intent, IntentIsSellable,
+    SKUName, Servers, NumRacks, IsUltraSSDEnabled, IsSpecialtySKU
+;
+// STEP 4: Tenant/platform workload
+let TenantWorkloadData =
+cluster('azurecm.kusto.windows.net').database('AzureCM').LogTenantSnapshot
+| where PreciseTimeStamp > ago(2h)
+| where Tenant in (Gen4WithoutDecomPair)
+| extend NonGuidTenant = isnull(toguid(tenantName))
+| summarize arg_max(PreciseTimeStamp, *) by Tenant, tenantName
+| extend TenantInfo = strcat(tenantName, ':#', numRoleInstances, ':U-', maxUpdateDomain)
+| extend HasUDGreaterThan10 = iff(toint(maxUpdateDomain) > 10, long(1), long(0))
+| extend HasInstancesGreaterThan10 = iff(toint(numRoleInstances) > 10, long(1), long(0))
+| summarize 
+    GuidTenant=countif(NonGuidTenant == false),
+    MaxUpdateDomain = maxif(maxUpdateDomain, NonGuidTenant == true),
+    TenantList=array_strcat(array_sort_asc(make_set_if(TenantInfo, NonGuidTenant == true)), ','),
+    HasUDGreaterThan10=iff(sum(HasUDGreaterThan10) > 0, true, false),
+    HasInstancesGreaterThan10=iff(sum(HasInstancesGreaterThan10) > 0, true, false),
+    TotalInstances=sum(toint(numRoleInstances)),
+    TenantCount=count()
+    by Tenant
+| extend 
+    HasSLB = iff(TenantList contains 'slb', true, false),
+    HasWARP = iff(TenantList contains 'warp', true, false),
+    HasPlatformTenant = isnotempty(TenantList),
+    HasSQL = false
+| project Tenant, HasPlatformTenant, HasWARP, HasSLB, HasSQL, HasUDGreaterThan10, HasInstancesGreaterThan10, 
+    TotalInstances, TenantCount
+;
+// STEP 5: Hot Regions — GLOBAL LATEST snapshot (normalize Region for join)
+let HotRegions_Snapshot =
+cluster('onecapacityfollower.centralus.kusto.windows.net').database('Shared')._Cache_Fraud_RegionPrioritization
+| where Reason == "Hot Region"
+| as HR
+| where TimeStamp == toscalar(HR | summarize max(TimeStamp))
+| summarize
+    RegionHotnessPriority = min(Priority),
+    LatestHotTimestamp   = max(TimeStamp),
+    HotRegionVMSeriesD   = make_set(VMSeries)
+  by Region
+| extend HotRegionVMSeries = array_strcat(HotRegionVMSeriesD, ','),
+         RegionKey = tolower(replace_string(tostring(Region), " ", ""))
+| project RegionKey, Region, RegionHotnessPriority, HotRegionVMSeries, LatestHotTimestamp
+;
+// STEP 6: Regional health (latest 1d; normalize Region too)
+let RegionalHealthData =  
+cluster('onecapacityfollower.centralus.kusto.windows.net').database('Shared')._CCC_Cache_RegionHealthLevel_Prediction
+| where PreciseTimeStamp >= ago(1d)
+| summarize arg_max(PreciseTimeStamp, *) by Region
+| extend RegionKey = tolower(replace_string(tostring(Region), " ", ""))
+| project RegionKey, Region,
+         RegionHealthScore = ProjectedRegionHealthScore,
+         RegionHealthLevel = ProjectedRegionHealthLevel,
+         RegionHealthProjectedTime
+;
+// STEP 7: Build base (util + tenant + props), then join by RegionKey
+ClusterUtilizationData
+| join kind=inner     TenantWorkloadData  on $left.Cluster == $right.Tenant
+| join kind=leftouter ClusterPropertiesData on $left.Cluster == $right.Cluster
+| extend RegionKey = tolower(replace_string(tostring(Region), " ", ""))   // normalize for join
+| join kind=leftouter HotRegions_Snapshot on RegionKey
+| join kind=leftouter RegionalHealthData  on RegionKey
+| extend
+    // no defaulting of RegionHotnessPriority; just boolean flag
+    IsHotRegion = iff(isnotempty(RegionHotnessPriority), true, false),
+    // fills for core props only
+    ClusterAgeDays = coalesce(ClusterAgeDays, long(-1)),
+    ClusterAgeYears = coalesce(ClusterAgeYears, -1.0),
+    DecommissionYearsRemaining = coalesce(DecommissionYearsRemaining, -1.0),
+    HasSQL = iff(UsedSQL > 0, true, false),
+    Region = coalesce(Region, ''),
+    AvailabilityZone = coalesce(AvailabilityZone, ''),
+    DC = coalesce(DC, ''),
+    PhysicalAZ = coalesce(PhysicalAZ, ''),
+    Generation = iff(isempty(Generation), '', Generation),
+    Manufacturer = iff(isempty(Manufacturer), '', Manufacturer),
+    MemCategory = iff(isempty(MemCategory), '', MemCategory),
+    SKUName = iff(isempty(SKUName), '', SKUName),
+    CloudType = iff(isempty(CloudType), '', CloudType),
+    RegionType = iff(isempty(RegionType), '', RegionType),
+    Intent = iff(isempty(Intent), '', Intent),
+    IntentIsSellable = iff(isempty(IntentIsSellable), '', IntentIsSellable),
+    TransitionSKUCategory = iff(isempty(TransitionSKUCategory), '', TransitionSKUCategory),
+    ClusterType = iff(isempty(ClusterType), '', ClusterType),
+    TenantWithMaxFD = iff(isempty(TenantWithMaxFD), '', TenantWithMaxFD),
+    Servers = coalesce(Servers, long(0)),
+    NumRacks = coalesce(NumRacks, long(0)),
+    IsUltraSSDEnabled = coalesce(IsUltraSSDEnabled, false),
+    IsSpecialtySKU = coalesce(IsSpecialtySKU, false),
+    PhysicalCoresPerNode = coalesce(PhysicalCoresPerNode, long(0)),
+    MPCountInCluster = coalesce(MPCountInCluster, long(0)),
+    RackCountInCluster = coalesce(RackCountInCluster, long(0)),
+    IsLive = coalesce(IsLive, true),
+    IsTargetMP = coalesce(IsTargetMP, false),
+    NodeCount_IOwnMachine = coalesce(NodeCount_IOwnMachine, long(0)),
+    NodeCount_32VMs = coalesce(NodeCount_32VMs, long(0)),
+    StrandedCores_32VMs = coalesce(StrandedCores_32VMs, 0.0)
+| project
+    // Identity & location
+    ClusterId = Cluster,
+    Region, AvailabilityZone, DataCenter = DC, PhysicalAZ,
+    // Age & timeline
+    ClusterAgeYears, ClusterAgeDays, DecommissionYearsRemaining, Intent, IntentIsSellable,
+    // HW / SKU
+    Generation, Manufacturer, MemCategory, SKUName, Servers, NumRacks,
+    IsUltraSSDEnabled, IsSpecialtySKU, CloudType, RegionType, TransitionSKUCategory,
+    // Infra details
+    PhysicalCoresPerNode, MPCountInCluster, RackCountInCluster, IsLive, ClusterType, IsTargetMP,
+    // Core Utilization
+    TotalPhysicalCores = TotalCore, UsedCores = UsedCore, UsedCores_SQL = UsedSQL, 
+    UsedCores_NonSQL = UsedNonSQL, UsedCores_NonSQL_Spannable = UsedNonSQL_Spannable,
+    UsedCores_NonSQL_NonSpannable = UsedNonSQL_NonSpannable, CoreUtilization,
+    // VM & capacity
+    VMCount, VMCount_SQL, VMCount_NonSQL, VMCount_NonSQL_Spannable, VMCount_NonSQL_NonSpannable,
+    MaxSupportedVMs, VMDensity,
+    // Health
+    TotalNodes = Nodes, OutOfServiceNodes = OutOfServices, DNG_Nodes,
+    StrandedCores_DNG, StrandedCores_TIP, OutOfServicesPercentage,
+    NodeCount_IOwnMachine, NodeCount_32VMs, StrandedCores_32VMs,
+    // Workload / tenant
+    HasPlatformTenant, HasWARP, HasSLB, HasSQL, HasUDGreaterThan10, HasInstancesGreaterThan10,
+    TotalInstances, TenantCount, TenantWithMaxFD,
+    // Efficiency ratios
+    SQL_Ratio, NonSpannable_Ratio, SpannableUtilizationRatio, HealthyNodeRatio, EffectiveCoreUtilization,
+    // Hot Region (assigned by Region)
+    IsHotRegion, RegionHotnessPriority, HotRegionVMSeries, LatestHotTimestamp,
+    // Regional health
+    RegionHealthScore, RegionHealthLevel, RegionHealthProjectedTime

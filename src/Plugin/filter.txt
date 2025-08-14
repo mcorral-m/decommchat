@@ -1,0 +1,506 @@
+#nullable enable
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Globalization;
+using System.Linq;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+using Microsoft.SemanticKernel;
+using MyM365AgentDecommision.Bot.Interfaces;  // IClusterDataProvider
+using MyM365AgentDecommision.Bot.Models;      // ClusterRow
+using MyM365AgentDecommision.Bot.Services;    // ScoringService
+
+namespace MyM365AgentDecommision.Bot.Plugins
+{
+    /// <summary>
+    /// Plugin providing access to cluster filtering, sorting, and criteria-based selection.
+    /// Supports both single criteria filtering and multi-criteria plans with union/intersect operations.
+    /// Includes discovery methods to help users understand available filtering options.
+    /// </summary>
+    public sealed class ClusterFilteringPlugin
+    {
+        private readonly IClusterDataProvider _data;
+        private readonly ILogger<ClusterFilteringPlugin>? _log;
+        private readonly ScoringService _scoringService;
+
+        private static readonly JsonSerializerOptions JsonOpts = new(JsonSerializerDefaults.Web)
+        {
+            PropertyNameCaseInsensitive = true,
+            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+            WriteIndented = false
+        };
+
+        public ClusterFilteringPlugin(
+            IClusterDataProvider data,
+            ScoringService scoringService,
+            ILogger<ClusterFilteringPlugin>? log = null)
+        {
+            _data = data;
+            _scoringService = scoringService;
+            _log = log;
+        }
+
+        // ---------------------- Typed DTOs (no anonymous objects) -----------------
+
+        public sealed record ErrorDto(string Error);
+        public sealed record FieldInfo(string Name, string Kind);
+
+        public sealed record FilterResponse(
+            int Total,        // total rows in dataset
+            int Returned,     // rows after filter
+            IEnumerable<ClusterRow> Items
+        );
+
+        public sealed record PlanResponse(
+            string Mode,      // "Union" | "Intersect"
+            int Total,
+            int Returned,
+            IEnumerable<ClusterRow> Items
+        );
+
+        // ------------------------------------------------------------------------
+        // Single-criteria filtering (JSON in → filtered rows out)
+        // ------------------------------------------------------------------------
+        [KernelFunction, Description("Filter clusters by one Criteria JSON. Returns {total, returned, items}.")]
+        public async Task<string> FilterByCriteriaJsonAsync(
+            [Description("JSON encoding of ClusterFilterEngine.Criteria")] string criteriaJson,
+            CancellationToken ct = default)
+        {
+            try
+            {
+                var rows = await _data.GetClusterRowDataAsync(ct);
+
+                ClusterFilterEngine.Criteria criteria;
+                try
+                {
+                    criteria = JsonSerializer.Deserialize<ClusterFilterEngine.Criteria>(criteriaJson, JsonOpts) ?? new();
+                }
+                catch (Exception ex)
+                {
+                    _log?.LogWarning(ex, "Invalid criteria JSON");
+                    return JsonSerializer.Serialize<ErrorDto>(new($"Invalid criteria JSON: {ex.Message}"), JsonOpts);
+                }
+
+                var result = ClusterFilterEngine.Apply(rows, criteria);
+                var payload = new FilterResponse(
+                    Total: rows.Count,
+                    Returned: result.Count,
+                    Items: result
+                );
+                return JsonSerializer.Serialize(payload, JsonOpts);
+            }
+            catch (OperationCanceledException)
+            {
+                return JsonSerializer.Serialize(new ErrorDto("Operation cancelled."), JsonOpts);
+            }
+            catch (Exception ex)
+            {
+                _log?.LogError(ex, "FilterByCriteriaJsonAsync failed");
+                return JsonSerializer.Serialize(new ErrorDto($"Unhandled error: {ex.Message}"), JsonOpts);
+            }
+        }
+
+        // ------------------------------------------------------------------------
+        // Multi-criteria plan (Union/Intersect across multiple Criteria blocks)
+        // ------------------------------------------------------------------------
+        [KernelFunction, Description("Run a multi-query plan (Union/Intersect of multiple Criteria). Returns {mode, total, returned, items}.")]
+        public async Task<string> FilterByMultiPlanJsonAsync(
+            [Description("JSON encoding of ClusterFilterEngine.MultiQueryPlan")] string planJson,
+            CancellationToken ct = default)
+        {
+            try
+            {
+                var rows = await _data.GetClusterRowDataAsync(ct);
+
+                ClusterFilterEngine.MultiQueryPlan? plan;
+                try
+                {
+                    plan = JsonSerializer.Deserialize<ClusterFilterEngine.MultiQueryPlan>(planJson, JsonOpts);
+                }
+                catch (Exception ex)
+                {
+                    _log?.LogWarning(ex, "Invalid plan JSON");
+                    return JsonSerializer.Serialize<ErrorDto>(new($"Invalid plan JSON: {ex.Message}"), JsonOpts);
+                }
+
+                if (plan is null || plan.Items is null || plan.Items.Count == 0)
+                    return JsonSerializer.Serialize<ErrorDto>(new("Plan.Items is empty."), JsonOpts);
+
+                var result = ClusterFilterEngine.ApplyMany(rows, plan);
+                var payload = new PlanResponse(
+                    Mode: plan.Mode,
+                    Total: rows.Count,
+                    Returned: result.Count,
+                    Items: result
+                );
+                return JsonSerializer.Serialize(payload, JsonOpts);
+            }
+            catch (OperationCanceledException)
+            {
+                return JsonSerializer.Serialize(new ErrorDto("Operation cancelled."), JsonOpts);
+            }
+            catch (Exception ex)
+            {
+                _log?.LogError(ex, "FilterByMultiPlanJsonAsync failed");
+                return JsonSerializer.Serialize(new ErrorDto($"Unhandled error: {ex.Message}"), JsonOpts);
+            }
+        }
+
+        // ------------------------------------------------------------------------
+        // Discovery helpers (introspection/templates)
+        // ------------------------------------------------------------------------
+        [KernelFunction, Description("List filterable fields and types supported by the engine.")]
+        public string ListFilterableFields()
+        {
+            var fields = ClusterFilterEngine.ListSupportedFields()
+                .Select(t => new FieldInfo(t.Field, t.Kind))
+                .ToList();
+
+            return JsonSerializer.Serialize(fields, JsonOpts);
+        }
+
+        [KernelFunction, Description("Return an example Criteria JSON template.")]
+        public string CriteriaTemplate()
+        {
+            var crit = new ClusterFilterEngine.Criteria
+            {
+                SortBy = "ClusterAgeYears",
+                SortDescending = true,
+                Take = 10
+            };
+            return JsonSerializer.Serialize(crit, JsonOpts);
+        }
+
+        /// <summary>
+        /// Gets information about scoring factors that can be customized with weights.
+        /// </summary>
+        [KernelFunction, Description("List all available scoring factors that can be customized with weights when scoring clusters for decommissioning.")]
+        public string GetScorableFactors()
+        {
+            var catalog = _scoringService.GetFeatureCatalog();
+            var factors = catalog.Select(f => new
+            {
+                Name = f.Name,
+                Kind = f.Kind,
+                Unit = f.Unit,
+                HigherIsBetter = f.HigherIsBetter,
+                Description = GetFactorDescription(f.Name)
+            }).ToList();
+
+            return JsonSerializer.Serialize(factors, JsonOpts);
+        }
+
+        /// <summary>
+        /// Provides a detailed tutorial on how to customize scoring weights for decommissioning.
+        /// </summary>
+        [KernelFunction, Description("Get a tutorial on how to customize scoring weights for decommissioning.")]
+        public string GetWeightCustomizationTutorial()
+        {
+            var tutorial = @"# Customizing Decommission Scoring Weights Tutorial
+
+## Overview
+The decommission scoring system uses weighted factors to determine which clusters are the best candidates for decommissioning. By default, these weights are balanced across multiple factors, but you can customize them to prioritize specific aspects.
+
+## Key Concepts
+- **Weights**: Each factor has a weight between 0 and 1 (we normalize automatically).
+- **Normalization**: All weights are automatically normalized to sum to 1.0.
+- **Higher is better**: A higher score means a cluster is a better decommissioning candidate.
+
+## Main Scoring Factors
+1. **Age** (ClusterAgeYears): Older clusters generally score higher.
+2. **Utilization** (EffectiveCoreUtilization): Lower utilization = better candidate.
+3. **Health** (RegionHealthScore, OOSNodeRatio): More issues raise priority.
+4. **Stranded Resources** (StrandedCoresRatio_*): More stranded → higher priority.
+5. **Workloads** (HasSQL, HasSLB, HasWARP): Make decom harder, often down-weighted.
+
+## How to Customize Weights
+1. Call GetScorableFactors() to see available factors.
+2. Call CreateCustomWeights(""age=4, utilization=0.15, health=0.2, strandedCores=0.1"") using friendly keys.
+3. Pass the returned JSON to FilterAndScoreAsync or ScoreTopNAsync.
+
+Tip: For a strict age-only ranking, set weight to just ClusterAgeYears=1.0.";
+            return tutorial;
+        }
+
+        /// <summary>
+        /// Creates a custom weight configuration from a simple string of factor=weight pairs (friendly keys allowed).
+        /// </summary>
+        [KernelFunction, Description("Create a custom weight configuration from comma-separated factor=weight pairs (friendly keys allowed, e.g. 'age=4, utilization=0.15').")]
+        public string CreateCustomWeights(string weightPairs)
+        {
+            try
+            {
+                var dict = new ScoringService.WeightConfig();
+                foreach (var part in weightPairs.Split(',', StringSplitOptions.RemoveEmptyEntries))
+                {
+                    var kv = part.Split('=', 2, StringSplitOptions.TrimEntries);
+                    if (kv.Length != 2) continue;
+                    if (double.TryParse(kv[1], NumberStyles.Float, CultureInfo.InvariantCulture, out var v))
+                    {
+                        dict[CanonFeature(kv[0])] = v;
+                    }
+                }
+
+                var norm = ScoringService.Rebalance(dict);
+                return JsonSerializer.Serialize(norm, JsonOpts);
+            }
+            catch (Exception ex)
+            {
+                return JsonSerializer.Serialize(new ErrorDto($"Failed to create weights: {ex.Message}"), JsonOpts);
+            }
+        }
+
+        /// <summary>
+        /// Retrieves the default scoring weights used by the system.
+        /// </summary>
+        [KernelFunction, Description("Get the default weights used by the scoring system.")]
+        public string GetDefaultWeights()
+        {
+            try
+            {
+                var defaultWeights = ScoringService.DefaultWeights();
+
+                var result = defaultWeights.Select(kv => new
+                {
+                    Factor = kv.Key,
+                    Weight = kv.Value,
+                    Description = GetFactorDescription(kv.Key)
+                })
+                .OrderByDescending(x => x.Weight)
+                .ToList();
+
+                return JsonSerializer.Serialize(result, JsonOpts);
+            }
+            catch (Exception ex)
+            {
+                return JsonSerializer.Serialize(new ErrorDto($"Failed to get default weights: {ex.Message}"), JsonOpts);
+            }
+        }
+
+        /// <summary>
+        /// Filters and scores clusters in a single operation.
+        /// Accepts friendly-weight keys (e.g., ""age=4, utilization=0.15"" or JSON).
+        /// Disables winsorization automatically when only one factor is active.
+        /// Adds a deterministic tie-breaker based on the primary factor's raw value.
+        /// </summary>
+        [KernelFunction, Description("Filter and score clusters with optional custom weights (friendly keys allowed), returning top N candidates.")]
+        public async Task<string> FilterAndScoreAsync(
+            [Description("Optional JSON criteria for filtering clusters")] string? filterCriteria = null,
+            [Description("Optional weight configuration as JSON or 'k=v, ...' with friendly keys")] string? weightConfig = null,
+            [Description("Number of top-scored clusters to return")] int topN = 10,
+            CancellationToken ct = default)
+        {
+            try
+            {
+                // Step 1: Load data
+                var rows = await _data.GetClusterRowDataAsync(ct);
+
+                // Step 2: Apply filter (if provided)
+                IReadOnlyList<ClusterRow> filteredRows = rows;
+                if (!string.IsNullOrWhiteSpace(filterCriteria))
+                {
+                    try
+                    {
+                        var criteria = JsonSerializer.Deserialize<ClusterFilterEngine.Criteria>(filterCriteria, JsonOpts) ?? new();
+                        filteredRows = ClusterFilterEngine.Apply(rows, criteria);
+                    }
+                    catch (Exception ex)
+                    {
+                        _log?.LogWarning(ex, "Invalid filter criteria JSON");
+                        return JsonSerializer.Serialize(new ErrorDto($"Invalid filter criteria JSON: {ex.Message}"), JsonOpts);
+                    }
+                }
+
+                // Step 3: Parse weights (friendly keys + k=v pairs allowed)
+                var weights = ParseWeightsFlexible(weightConfig);
+
+                // Step 4: Scoring options - disable winsorization for single-factor runs
+                var options = new ScoringService.ScoringOptions();
+                if (weights is not null)
+                {
+                    var active = weights.Where(kv => kv.Value > 0).Select(kv => kv.Key).ToList();
+                    if (active.Count == 1)
+                    {
+                        options = new ScoringService.ScoringOptions { Winsorize = false };
+                    }
+                }
+
+                // Step 5: Score everything once, then filter the results to our filtered set
+                var scoreResult = await _scoringService.ScoreAllAsync(weights, options, ct);
+
+                var filteredIds = new HashSet<string>(
+                    filteredRows.Select(r => r.Cluster ?? r.ClusterId ?? string.Empty),
+                    StringComparer.OrdinalIgnoreCase);
+
+                // Determine primary factor for deterministic tie-break
+                var primary = (weights is not null && weights.Count > 0)
+                    ? weights.OrderByDescending(kv => kv.Value).First().Key
+                    : "ClusterAgeYears";
+
+                double TieKey(ScoringService.ScoreRowBreakdown r)
+                {
+                    var f = r.Factors.FirstOrDefault(x => string.Equals(x.Property, primary, StringComparison.OrdinalIgnoreCase));
+                    if (f is null || f.Raw is null) return double.NaN;
+                    return f.Inverted ? -f.Raw.Value : f.Raw.Value;
+                }
+
+                var ranked = scoreResult.Rankings
+                    .Where(r => filteredIds.Contains(r.Cluster))
+                    .OrderByDescending(r => r.Score)
+                    .ThenByDescending(r => TieKey(r))
+                    .Take(Math.Min(topN, filteredRows.Count))
+                    .ToList();
+
+                // Step 6: Build a rich response with details
+                var rowLookup = rows.ToDictionary(r => r.Cluster ?? r.ClusterId ?? string.Empty, StringComparer.OrdinalIgnoreCase);
+
+                var result = new
+                {
+                    Total = rows.Count,
+                    Filtered = filteredRows.Count,
+                    Returned = ranked.Count,
+                    PrimaryFactor = primary,
+                    CustomWeightsApplied = weights is not null,
+                    Items = ranked.Select((c, idx) =>
+                    {
+                        rowLookup.TryGetValue(c.Cluster, out var r);
+                        return new
+                        {
+                            rank = idx + 1,
+                            cluster = c.Cluster,
+                            score = Math.Round(c.Score, 4),
+                            details = r is null ? null : new
+                            {
+                                region = r.Region,
+                                availabilityZone = r.AvailabilityZone,
+                                ageYears = r.ClusterAgeYears,
+                                coreUtilization = r.CoreUtilization,
+                                totalCores = r.TotalPhysicalCores,
+                                usedCores = r.UsedCores,
+                                totalNodes = r.TotalNodes,
+                                outOfServiceNodes = r.OutOfServiceNodes,
+                                hasSQL = r.HasSQL,
+                                hasSLB = r.HasSLB,
+                                hasWARP = r.HasWARP,
+                                isHotRegion = r.IsHotRegion
+                            },
+                            factors = c.Factors
+                                .Where(f => f.Contribution > 0.0001)
+                                .OrderByDescending(f => f.Contribution)
+                                .Select(f => new
+                                {
+                                    property = f.Property,
+                                    rawValue = f.Raw,
+                                    normalizedScore = Math.Round(f.Normalized, 4),
+                                    weight = Math.Round(f.Weight, 4),
+                                    contribution = Math.Round(f.Contribution, 4),
+                                    inverted = f.Inverted,
+                                    description = GetFactorDescription(f.Property)
+                                })
+                                .Take(12)
+                                .ToList()
+                        };
+                    }).ToList()
+                };
+
+                return JsonSerializer.Serialize(result, JsonOpts);
+            }
+            catch (OperationCanceledException)
+            {
+                return JsonSerializer.Serialize(new ErrorDto("Operation cancelled."), JsonOpts);
+            }
+            catch (Exception ex)
+            {
+                _log?.LogError(ex, "FilterAndScoreAsync failed");
+                return JsonSerializer.Serialize(new ErrorDto($"Unhandled error: {ex.Message}"), JsonOpts);
+            }
+        }
+
+        /// <summary>
+        /// Returns a human-readable description for scoring factors.
+        /// </summary>
+        private static string GetFactorDescription(string factorName) => factorName switch
+        {
+            // Core trio
+            "ClusterAgeYears" => "Age of the cluster in years - older clusters are better candidates for decommissioning.",
+            "EffectiveCoreUtilization" => "Effective core usage; lower utilization raises decom priority.",
+            "RegionHealthScore" => "Region health score; poorer health raises decom priority.",
+
+            // Health / stranding
+            "OOSNodeRatio" => "Ratio of out-of-service nodes; higher suggests maintenance issues.",
+            "StrandedCoresRatio_DNG" => "Cores stranded due to Do Not Grow status.",
+            "StrandedCoresRatio_TIP" => "Cores stranded due to test/dev workloads.",
+            "StrandedCoresRatio_32VMs" => "Cores stranded due to 32-core VM constraints.",
+
+            // Region & timeline
+            "IsHotRegion" => "Whether the cluster is in a high-demand region (penalizes decom).",
+            "DecommissionYearsRemaining" => "Years until planned retirement; fewer years raises priority.",
+
+            // Stickiness
+            "HasSQL" => "Hosts SQL workloads; harder to decommission.",
+            "HasSLB" => "Hosts load-balancer workloads; harder to decommission.",
+            "HasWARP" => "Hosts WARP workloads; harder to decommission.",
+
+            // Mix
+            "SQL_Ratio" => "Proportion of SQL VMs.",
+            "NonSpannable_Ratio" => "Proportion of non-spannable utilization.",
+            "SpannableUtilizationRatio" => "Spannable utilization ratio.",
+            _ => $"A factor used in decommission scoring calculations"
+        };
+
+        // ------------------------------ Helpers ---------------------------------
+
+        /// <summary>
+        /// Map friendly factor names to canonical feature keys used by ScoringService.
+        /// </summary>
+        private static string CanonFeature(string k) => k.Trim().ToLowerInvariant() switch
+        {
+            "age" or "clusterage" or "ageyears"                => "ClusterAgeYears",
+            "util" or "utilization" or "coreutilization"       => "EffectiveCoreUtilization",
+            "health" or "regionhealth"                          => "RegionHealthScore",
+            "stranded" or "strandedcores" or "stranded_ratio"  => "StrandedCoresRatio_DNG",
+            _ => k
+        };
+
+        /// <summary>
+        /// Parse weights from JSON or ""k=v, ..."" pairs, accepting friendly keys.
+        /// Returns null if nothing parseable is found.
+        /// </summary>
+        private static ScoringService.WeightConfig? ParseWeightsFlexible(string? weightsSpec)
+        {
+            if (string.IsNullOrWhiteSpace(weightsSpec)) return null;
+
+            // 1) Try JSON directly
+            try
+            {
+                var w = JsonSerializer.Deserialize<ScoringService.WeightConfig>(weightsSpec, JsonOpts);
+                if (w is not null)
+                {
+                    var canon = new ScoringService.WeightConfig();
+                    foreach (var (k, v) in w)
+                        canon[CanonFeature(k)] = v;
+                    return canon;
+                }
+            }
+            catch { /* fall through to k=v parsing */ }
+
+            // 2) Try "k=v, k=v" format
+            var dict = new ScoringService.WeightConfig();
+            foreach (var part in weightsSpec.Split(',', StringSplitOptions.RemoveEmptyEntries))
+            {
+                var kv = part.Split('=', 2, StringSplitOptions.TrimEntries);
+                if (kv.Length != 2) continue;
+                if (double.TryParse(kv[1], NumberStyles.Float, CultureInfo.InvariantCulture, out var v))
+                {
+                    dict[CanonFeature(kv[0])] = v;
+                }
+            }
+
+            return dict.Count == 0 ? null : dict;
+        }
+    }
+}

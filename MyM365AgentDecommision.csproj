@@ -1,0 +1,75 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <NoWarn>$(NoWarn);SKEXP0110;SKEXP0010;SKEXP0060;SKEXP0001;CS8632;IDE0005</NoWarn>
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+    <GenerateProgramFile>false</GenerateProgramFile>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Core Semantic Kernel packages - Using consistent 1.60.0 versions -->
+    <PackageReference Include="Azure.AI.OpenAI" Version="2.2.0-beta.4" />
+    <PackageReference Include="Azure.Core" Version="1.47.1" />
+    <PackageReference Include="Microsoft.Agents.Builder" Version="1.2.32-beta" />
+    <PackageReference Include="Microsoft.Agents.Core" Version="1.2.32-beta" />
+    <PackageReference Include="Microsoft.SemanticKernel" Version="1.60.0" />
+    <PackageReference Include="Microsoft.SemanticKernel.Agents.Core" Version="1.60.0" />
+    <PackageReference Include="Microsoft.SemanticKernel.Agents.OpenAI" Version="1.60.0-preview" />
+    <PackageReference Include="Microsoft.SemanticKernel.Agents.Orchestration" Version="1.60.0-preview" />
+    <PackageReference Include="Microsoft.SemanticKernel.Agents.Runtime.InProcess" Version="1.60.0-preview" />
+    <PackageReference Include="Microsoft.SemanticKernel.Connectors.AzureOpenAI" Version="1.60.0" />
+    <PackageReference Include="Microsoft.SemanticKernel.Connectors.OpenAI" Version="1.60.0" />
+    
+    <!-- Microsoft 365 Agents SDK -->
+    <PackageReference Include="Microsoft.Agents.Authentication.Msal" Version="1.*" />
+    <PackageReference Include="Microsoft.Agents.Hosting.AspNetCore" Version="1.2.32-beta" />
+    
+    <!-- Supporting packages -->
+    <PackageReference Include="Azure.Identity" Version="1.14.2" />
+    <PackageReference Include="AdaptiveCards" Version="3.1.0" />
+    <PackageReference Include="ModelContextProtocol" Version="0.3.0-preview.3" />
+    <PackageReference Include="Swashbuckle.AspNetCore" Version="9.0.3" />
+    <PackageReference Include="System.ComponentModel.Annotations" Version="5.0.0" />
+    
+    <!-- Azure Data Explorer (Kusto) packages -->
+    <PackageReference Include="Microsoft.Azure.Kusto.Data" Version="13.0.2" />
+    <PackageReference Include="Microsoft.Azure.Kusto.Ingest" Version="13.0.2" />
+    
+    <!-- Test packages -->
+    <PackageReference Include="xunit" Version="2.7.0" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.0" />
+    <PackageReference Include="Moq" Version="4.20.70" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+  </ItemGroup>
+  <!-- Exclude local settings from publish -->
+  <ItemGroup>
+    <Content Remove="appsettings.Development.json" />
+    <Content Include="appsettings.Development.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>None</CopyToPublishDirectory>
+    </Content>
+    <Content Remove="appsettings.Playground.json" />
+    <Content Include="appsettings.Playground.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>None</CopyToPublishDirectory>
+    </Content>
+  </ItemGroup>
+  
+
+  
+  <!-- Exclude Tests from main build for M365 agent -->
+  <ItemGroup>
+    <Compile Remove="Tests\**" />
+    <EmbeddedResource Remove="Tests\**" />
+    <None Remove="Tests\**" />
+    <Content Remove="Tests\**" />
+  </ItemGroup>
+  
+  <ItemGroup>
+    <None Include="appsettings.Development.json" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,77 @@
+{
+  "mcpServers": {
+    "github": {
+      "command": "docker",
+      "args": [
+        "run",
+        "-i",
+        "--rm",
+        "-e",
+        "GITHUB_PERSONAL_ACCESS_TOKEN",
+        "ghcr.io/github/github-mcp-server"
+      ],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_PERSONAL_ACCESS_TOKEN}"
+      },
+      "description": "GitHub repository and issue management for decommission tracking"
+    },
+    "filesystem": {
+      "command": "npx",
+      "args": [
+        "@modelcontextprotocol/server-filesystem",
+        "./Data"
+      ],
+      "env": {},
+      "description": "File system access for decommission documentation and logs"
+    },
+    "azure-devops": {
+      "command": "npx", 
+      "args": [
+        "@azure/mcp-server-devops"
+      ],
+      "env": {
+        "AZURE_DEVOPS_PAT": "${AZURE_DEVOPS_PAT}",
+        "AZURE_DEVOPS_ORG": "${AZURE_DEVOPS_ORG}"
+      },
+      "description": "Azure DevOps integration for change management workflows"
+    },
+    "kusto-advanced": {
+      "type": "remote",
+      "url": "${KUSTO_MCP_SERVER_URL}",
+      "headers": {
+        "Authorization": "Bearer ${KUSTO_MCP_AUTH_TOKEN}"
+      },
+      "description": "Advanced Kusto operations via MCP (custom server)"
+    },
+    "servicenow": {
+      "command": "npx",
+      "args": [
+        "@servicenow/mcp-server"
+      ],
+      "env": {
+        "SERVICENOW_INSTANCE": "${SERVICENOW_INSTANCE}",
+        "SERVICENOW_USERNAME": "${SERVICENOW_USERNAME}", 
+        "SERVICENOW_PASSWORD": "${SERVICENOW_PASSWORD}"
+      },
+      "description": "ServiceNow integration for ITSM workflows and change requests"
+    }
+  },
+  "mcpServerSettings": {
+    "autoConnect": true,
+    "retryAttempts": 3,
+    "timeoutSeconds": 30,
+    "enableLogging": true
+  },
+  "environmentVariables": {
+    "_comment": "Set these in your environment or appsettings",
+    "GITHUB_PERSONAL_ACCESS_TOKEN": "Your GitHub token for repository access",
+    "AZURE_DEVOPS_PAT": "Your Azure DevOps personal access token",
+    "AZURE_DEVOPS_ORG": "Your Azure DevOps organization",
+    "KUSTO_MCP_SERVER_URL": "URL for custom Kusto MCP server",
+    "KUSTO_MCP_AUTH_TOKEN": "Auth token for Kusto MCP server",
+    "SERVICENOW_INSTANCE": "Your ServiceNow instance URL",
+    "SERVICENOW_USERNAME": "ServiceNow username",
+    "SERVICENOW_PASSWORD": "ServiceNow password",
+    "DECOM_DOCS_PATH": "Path to decommission documentation folder"
+  }
+}
