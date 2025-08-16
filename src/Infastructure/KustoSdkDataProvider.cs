@@ -602,11 +602,6 @@ public class DynamicKustoQueryHelperFactory : IKustoQueryHelperFactory
             // Fallback: embedded validated comprehensive query with dual-mode tenant analysis
             _logger.LogInformation("Using embedded query fallback as no file was found");
             return """
-// ============================================================================
-// MAIN: Util + Props + Tenant  +  Hot Regions (per Region)  +  Regional Health
-//  - RegionHotnessPriority is assigned by Region (no default 999)
-//  - Uses GLOBAL LATEST snapshot of hot regions (one row per Region)
-// ============================================================================
 // STEP 1: Gen4 clusters
 let Gen4WithoutDecomPair =
 cluster('azuredcm.kusto.windows.net').database('AzureDCMDb').dcmInventoryGenerationMappingV3
@@ -720,7 +715,7 @@ cluster('onecapacityfollower.centralus.kusto.windows.net').database('Shared')._C
     HotRegionVMSeriesD   = make_set(VMSeries)
   by Region
 | extend HotRegionVMSeries = array_strcat(HotRegionVMSeriesD, ','),
-         RegionKey = tolower(trim(' ', Region))
+         RegionKey = tolower(replace_string(tostring(Region), " ", ""))
 | project RegionKey, Region, RegionHotnessPriority, HotRegionVMSeries, LatestHotTimestamp
 ;
 // STEP 6: Regional health (latest 1d; normalize Region too)
@@ -728,7 +723,7 @@ let RegionalHealthData =
 cluster('onecapacityfollower.centralus.kusto.windows.net').database('Shared')._CCC_Cache_RegionHealthLevel_Prediction
 | where PreciseTimeStamp >= ago(1d)
 | summarize arg_max(PreciseTimeStamp, *) by Region
-| extend RegionKey = tolower(trim(' ', Region))
+| extend RegionKey = tolower(replace_string(tostring(Region), " ", ""))
 | project RegionKey, Region,
          RegionHealthScore = ProjectedRegionHealthScore,
          RegionHealthLevel = ProjectedRegionHealthLevel,
@@ -738,7 +733,7 @@ cluster('onecapacityfollower.centralus.kusto.windows.net').database('Shared')._C
 ClusterUtilizationData
 | join kind=inner     TenantWorkloadData  on $left.Cluster == $right.Tenant
 | join kind=leftouter ClusterPropertiesData on $left.Cluster == $right.Cluster
-| extend RegionKey = tolower(trim(' ', tostring(Region)))   // normalize for join
+| extend RegionKey = tolower(replace_string(tostring(Region), " ", ""))   // normalize for join
 | join kind=leftouter HotRegions_Snapshot on RegionKey
 | join kind=leftouter RegionalHealthData  on RegionKey
 | extend

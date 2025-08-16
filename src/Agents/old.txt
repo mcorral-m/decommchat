@@ -47,8 +47,7 @@ Available tool intents (not exhaustive):
 • Filtering: apply FilterCriteria, summary stats, distinct values, schema/field discovery.
 • Eligibility: pass/fail evaluation, explanations, summaries, projections (eligible soon), rules get/validate/save/reset.
 • Cards: render Top-N, grouped, compare, explain, sensitivity as Adaptive Card v1.5.
-• Export: convert tool JSON results into CSV/JSON files and return the file path envelope.
-";
+• Export: convert tool JSON results into CSV/JSON files and return the file path envelope.";
 
         public async Task<DecomChatEnvelope> RunAsync(string userInput, string sessionKey, CancellationToken ct = default)
         {

@@ -1,21 +1,31 @@
 // Program.cs
 #nullable enable
-using MyM365AgentDecommision;
-using MyM365AgentDecommision.Bot;                  // DecomAgentBot
-using MyM365AgentDecommision.Bot.Interfaces;       // IClusterDataProvider
-using MyM365AgentDecommision.Bot.Services;         // ScoringService, HybridParsingService
-using MyM365AgentDecommision.Infrastructure.Kusto; // KustoSdkDataProvider, factory
-using MyM365AgentDecommision.Bot.Plugins;          // ScoringPlugin, EligibilityPlugin, ClusterFilteringPlugin, AdaptiveCardPlugin
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 
 using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.Connectors.OpenAI;
+using MyM365AgentDecommision.Bot.Orchestration; // DecomQueryOrchestratorPlugin
 
-using Microsoft.Agents.Hosting.AspNetCore;
-using Microsoft.Agents.Builder.App;
+using Microsoft.Agents.Hosting.AspNetCore; // IAgentHttpAdapter, AddCloudAdapter()
+using Microsoft.Agents.Builder.App;        // IAgent
 using Microsoft.Agents.Builder;
-using Microsoft.Agents.Storage;
+using Microsoft.Agents.Storage;            // IStorage, MemoryStorage
 
-using Microsoft.Extensions.Logging;
+using MyM365AgentDecommision;                              // ConfigOptions
+using MyM365AgentDecommision.Bot;                          // DecomAgentBot : IAgent
+using MyM365AgentDecommision.Bot.Interfaces;               // IClusterDataProvider
+using MyM365AgentDecommision.Bot.Services;                 // Engines, stores, services
+using MyM365AgentDecommision.Infrastructure.Kusto;         // IKustoQueryHelperFactory, DynamicKustoQueryHelperFactory, KustoSdkDataProvider
+using MyM365AgentDecommision.Bot.Plugins;                  // Plugins
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -27,13 +37,21 @@ builder.Services.AddHttpContextAccessor();
 builder.Logging.ClearProviders();
 builder.Logging.AddConsole();
 
-// ---------------- SK + LLM ----------------
-builder.Services.AddKernel();
-
-// Bind config (see ConfigOptions type in your project)
+// ---------------- Config binding ----------------
 var config = builder.Configuration.Get<ConfigOptions>() ?? new ConfigOptions();
 
-// Prefer Azure OpenAI (project standard)
+// ---------------- SK + LLM (Azure OpenAI) ----------------
+if (string.IsNullOrWhiteSpace(config.Azure.OpenAIEndpoint) ||
+    string.IsNullOrWhiteSpace(config.Azure.OpenAIDeploymentName) ||
+    string.IsNullOrWhiteSpace(config.Azure.OpenAIApiKey))
+{
+    throw new InvalidOperationException(
+        "Azure OpenAI settings missing. Ensure Azure:OpenAIEndpoint, Azure:OpenAIDeploymentName, Azure:OpenAIApiKey are set.");
+}
+// REMOVE the generic AddKernel(); we'll register a custom Kernel below
+// builder.Services.AddKernel();
+
+// Register chat completion so DI can construct the orchestrator (IChatCompletionService)
 builder.Services.AddAzureOpenAIChatCompletion(
     deploymentName: config.Azure.OpenAIDeploymentName,
     endpoint:       config.Azure.OpenAIEndpoint,
@@ -42,12 +60,12 @@ builder.Services.AddAzureOpenAIChatCompletion(
 
 // ---------------- Data & Domain Services ----------------
 
-// Register the Kusto helper factory from configuration
-builder.Services.AddSingleton<IKustoQueryHelperFactory>(serviceProvider =>
+// 1) Kusto helper factory (shared)
+builder.Services.AddSingleton<IKustoQueryHelperFactory>(sp =>
 {
-    var logger         = serviceProvider.GetRequiredService<ILogger<DynamicKustoQueryHelperFactory>>();
-    var loggerFactory  = serviceProvider.GetRequiredService<ILoggerFactory>();
-    var configuration  = serviceProvider.GetRequiredService<IConfiguration>();
+    var logger        = sp.GetRequiredService<ILogger<DynamicKustoQueryHelperFactory>>();
+    var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
+    var configuration = sp.GetRequiredService<IConfiguration>();
 
     var kustoConfig       = configuration.GetSection("Kusto");
     var oneCapacityConfig = configuration.GetSection("OneCapacityKusto");
@@ -57,60 +75,86 @@ builder.Services.AddSingleton<IKustoQueryHelperFactory>(serviceProvider =>
     var onecapClusterUri = oneCapacityConfig["ClusterUri"]  ?? "https://onecapacityfollower.centralus.kusto.windows.net";
     var onecapDatabase   = oneCapacityConfig["DatabaseName"]?? "Shared";
 
-    // If UseUserPromptAuth is true, do NOT use managed identity
     var useManagedIdentity = !bool.Parse(kustoConfig["UseUserPromptAuth"] ?? "false");
-
-    var timeoutSeconds = int.Parse(kustoConfig["TimeoutSeconds"] ?? "300");
-    var defaultTimeout = TimeSpan.FromSeconds(timeoutSeconds);
+    var timeoutSeconds     = int.Parse(kustoConfig["TimeoutSeconds"] ?? "300");
+    var defaultTimeout     = TimeSpan.FromSeconds(timeoutSeconds);
 
     return new DynamicKustoQueryHelperFactory(
-        logger,
-        loggerFactory,
-        dcmClusterUri,
-        dcmDatabase,
-        onecapClusterUri,
-        onecapDatabase,
+        logger, loggerFactory,
+        dcmClusterUri, dcmDatabase,
+        onecapClusterUri, onecapDatabase,
         useManagedIdentity,
-        tenantId: null,
-        clientId: null,
-        clientSecret: null,
-        certificateThumbprint: null,
+        tenantId: null, clientId: null, clientSecret: null, certificateThumbprint: null,
         defaultTimeout
     );
 });
 
-// (Optional) activity context used by provider (if applicable)
-builder.Services.AddSingleton<IActivityContext, DefaultActivityContext>();
+// 2) Data provider — matches your ctor (logger, IKustoQueryHelperFactory, IActivityContext?)
+builder.Services.AddSingleton<IClusterDataProvider>(sp =>
+{
+    var log     = sp.GetRequiredService<ILogger<KustoSdkDataProvider>>();
+    var factory = sp.GetRequiredService<IKustoQueryHelperFactory>();
+    // activityContext is optional; provider will create DefaultActivityContext if null
+    return new KustoSdkDataProvider(log, factory);
+});
 
-// Data provider used by plugins/services
-builder.Services.AddSingleton<IClusterDataProvider, KustoSdkDataProvider>();
-
-// Instance domain services used by plugins
+// 3) Core engines & stores
+builder.Services.AddSingleton<FilteringEngine>();
+builder.Services.AddSingleton<EligibilityEngine>();
+builder.Services.AddSingleton<IWeightsStore, InMemoryWeightsStore>();                 // scoring weights store
+builder.Services.AddSingleton<IEligibilityRulesStore, InMemoryEligibilityRulesStore>(); // ✅ added to fix InvalidOperationException
 builder.Services.AddSingleton<ScoringService>();
+builder.Services.AddSingleton<CardFactory>();
 
-// 🔹 Hybrid parsing service (needs Kernel from DI)
-builder.Services.AddSingleton<HybridParsingService>(); // NEW: enables hybrid NL→Criteria/Weights in plugins
+// If other services need a request context:
+builder.Services.AddSingleton<MyM365AgentDecommision.Bot.Services.IRequestContext,
+                             MyM365AgentDecommision.Bot.Services.RequestContext>();
 
-// NOTE: Filter/Eligibility engines are static; no DI needed.
+// 4) Audit store (concrete type!)
+builder.Services.AddSingleton<IAuditLog, AuditLog>();
 
-// Plugins (resolved by KernelPluginFactory inside the agent)
+// 5) Plugins
 builder.Services.AddTransient<ScoringPlugin>();
-builder.Services.AddTransient<EligibilityPlugin>();
 builder.Services.AddTransient<ClusterFilteringPlugin>();
-builder.Services.AddTransient<AdaptiveCardPlugin>();
+builder.Services.AddTransient<EligibilityPlugin>();
+builder.Services.AddSingleton<ExportService>();
+builder.Services.AddTransient<ExportPlugin>();
+builder.Services.AddTransient<CardPlugin>();
+builder.Services.AddTransient<AuditPlugin>();
+builder.Services.AddSingleton<DecomQueryOrchestratorPlugin>();
 
-// ---------------- Agents Builder Hosting ----------------
+// --- Kernel: build and import plugins as SK tools ---
+builder.Services.AddSingleton<Kernel>(sp =>
+{
+    var kb = Kernel.CreateBuilder();
 
-// Volatile state for dev. For prod, use a durable IStorage implementation.
-builder.Services.AddSingleton<IStorage, MemoryStorage>();
+    // Ensure chat completion is available to the kernel
+    kb.AddAzureOpenAIChatCompletion(
+        deploymentName: config.Azure.OpenAIDeploymentName,
+        endpoint:       config.Azure.OpenAIEndpoint,
+        apiKey:         config.Azure.OpenAIApiKey);
 
-// Pull AgentApplicationOptions from config/DI and register defaults
+    var kernel = kb.Build();
+
+    // Existing plugin imports
+    kernel.ImportPluginFromObject(sp.GetRequiredService<ScoringPlugin>(), "scoring");
+    kernel.ImportPluginFromObject(sp.GetRequiredService<EligibilityPlugin>(), "eligibility");
+    kernel.ImportPluginFromObject(sp.GetRequiredService<ExportPlugin>(), "export");
+    kernel.ImportPluginFromObject(sp.GetRequiredService<AuditPlugin>(), "audit");
+
+    // NEW: orchestrator import
+    kernel.ImportPluginFromObject(sp.GetRequiredService<DecomQueryOrchestratorPlugin>(), "decom_orchestrator");
+
+    return kernel;
+});
+
+// 6) Agents SDK wiring
+builder.Services.AddSingleton<IStorage, MemoryStorage>(); // simple in-memory state for dev
+builder.Services.AddCloudAdapter();                       // registers concrete IAgentHttpAdapter 
 builder.AddAgentApplicationOptions();
-builder.Services.AddTransient<AgentApplicationOptions>();
+builder.AddAgent<DecomAgentBot>();                       // your bot implements IAgent
 
-// Register the bot host (routes messages to the SK DecommissionAgent internally)
-builder.AddAgent<DecomAgentBot>();
-
+//-------------------------------//
 var app = builder.Build();
 
 // ---------------- Optional: Kusto connection check on startup ----------------
@@ -133,7 +177,7 @@ if (app.Environment.IsDevelopment() || app.Environment.EnvironmentName == "Playg
             Console.ResetColor();
             logger.LogInformation("Kusto connection successful: {DataSourceInfo}", dataSourceInfo);
 
-            // Optional smoke test to verify query file loading
+            // Optional smoke test
             logger.LogInformation("Testing query execution to verify query file loading...");
             Console.WriteLine("Testing query execution to verify query file loading...");
             try
@@ -181,7 +225,6 @@ app.UseRouting();
 app.UseAuthentication();
 app.UseAuthorization();
 
-// Agents endpoint (Teams/Copilot adapter target)
 app.MapPost("/api/messages", async (
     HttpRequest request,
     HttpResponse response,
@@ -192,7 +235,6 @@ app.MapPost("/api/messages", async (
     await adapter.ProcessAsync(request, response, agent, cancellationToken);
 });
 
-// Simple health/root
 if (app.Environment.IsDevelopment() || app.Environment.EnvironmentName == "Playground")
 {
     app.MapGet("/", () => "Decom Bot");
